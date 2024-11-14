@@ -178,6 +178,7 @@ use crate::dom::webglrenderingcontext::WebGLRenderingContext;
 use crate::dom::wheelevent::WheelEvent;
 use crate::dom::window::{ReflowReason, Window};
 use crate::dom::windowproxy::WindowProxy;
+use crate::dom::xpathevaluator::XPathEvaluator;
 use crate::fetch::FetchCanceller;
 use crate::network_listener::{NetworkListener, PreInvoke};
 use crate::realms::{AlreadyInRealm, InRealm};
@@ -187,6 +188,8 @@ use crate::stylesheet_set::StylesheetSetRef;
 use crate::task::TaskBox;
 use crate::task_source::{TaskSource, TaskSourceName};
 use crate::timers::OneshotTimerCallback;
+
+use super::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
 
 /// The number of times we are allowed to see spurious `requestAnimationFrame()` calls before
 /// falling back to fake ones.
@@ -506,8 +509,8 @@ impl CollectionFilter for EmbedsFilter {
 struct LinksFilter;
 impl CollectionFilter for LinksFilter {
     fn filter(&self, elem: &Element, _root: &Node) -> bool {
-        (elem.is::<HTMLAnchorElement>() || elem.is::<HTMLAreaElement>()) &&
-            elem.has_attribute(&local_name!("href"))
+        (elem.is::<HTMLAnchorElement>() || elem.is::<HTMLAreaElement>())
+            && elem.has_attribute(&local_name!("href"))
     }
 }
 
@@ -677,6 +680,12 @@ impl Document {
     #[inline]
     pub fn is_html_document(&self) -> bool {
         self.is_html_document
+    }
+
+    pub fn is_xhtml_document(&self) -> bool {
+        self.content_type.type_() == mime::APPLICATION
+            && self.content_type.subtype().as_str() == "xhtml"
+            && self.content_type.suffix() == Some(mime::XML)
     }
 
     pub fn set_https_state(&self, https_state: HttpsState) {
@@ -1427,8 +1436,8 @@ impl Document {
             let line = click_pos - last_pos;
             let dist = (line.dot(line) as f64).sqrt();
 
-            if now.duration_since(last_time) < DBL_CLICK_TIMEOUT &&
-                dist < DBL_CLICK_DIST_THRESHOLD as f64
+            if now.duration_since(last_time) < DBL_CLICK_TIMEOUT
+                && dist < DBL_CLICK_DIST_THRESHOLD as f64
             {
                 // A double click has occurred if this click is within a certain time and dist. of previous click.
                 let click_count = 2;
@@ -1878,10 +1887,10 @@ impl Document {
         let mut cancel_state = event.get_cancel_state();
 
         // https://w3c.github.io/uievents/#keys-cancelable-keys
-        if keyboard_event.state == KeyState::Down &&
-            is_character_value_key(&(keyboard_event.key)) &&
-            !keyboard_event.is_composing &&
-            cancel_state != EventDefault::Prevented
+        if keyboard_event.state == KeyState::Down
+            && is_character_value_key(&(keyboard_event.key))
+            && !keyboard_event.is_composing
+            && cancel_state != EventDefault::Prevented
         {
             // https://w3c.github.io/uievents/#keypress-event-order
             let event = KeyboardEvent::new(
@@ -1915,8 +1924,8 @@ impl Document {
             // however *when* we do it is up to us.
             // Here, we're dispatching it after the key event so the script has a chance to cancel it
             // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27337
-            if (keyboard_event.key == Key::Enter || keyboard_event.code == Code::Space) &&
-                keyboard_event.state == KeyState::Up
+            if (keyboard_event.key == Key::Enter || keyboard_event.code == Code::Space)
+                && keyboard_event.state == KeyState::Up
             {
                 if let Some(elem) = target.downcast::<Element>() {
                     elem.upcast::<Node>()
@@ -2430,9 +2439,9 @@ impl Document {
         // and this method will panic.
         // The underlying problem might actually be that layout exits while it should be kept alive.
         // See https://github.com/servo/servo/issues/22507
-        let not_ready_for_load = self.loader.borrow().is_blocked() ||
-            !self.is_fully_active() ||
-            is_in_delaying_load_events_mode;
+        let not_ready_for_load = self.loader.borrow().is_blocked()
+            || !self.is_fully_active()
+            || is_in_delaying_load_events_mode;
 
         if not_ready_for_load {
             // Step 6.
@@ -4509,11 +4518,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             local_name.make_ascii_lowercase();
         }
 
-        let is_xhtml = self.content_type.type_() == mime::APPLICATION &&
-            self.content_type.subtype().as_str() == "xhtml" &&
-            self.content_type.suffix() == Some(mime::XML);
-
-        let ns = if self.is_html_document || is_xhtml {
+        let ns = if self.is_html_document || self.is_xhtml_document() {
             ns!(html)
         } else {
             ns!()
@@ -4908,8 +4913,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
         let node = new_body.upcast::<Node>();
         match node.type_id() {
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement))
+            | NodeTypeId::Element(ElementTypeId::HTMLElement(
                 HTMLElementTypeId::HTMLFrameSetElement,
             )) => {},
             _ => return Err(Error::HierarchyRequest),
@@ -5194,8 +5199,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                         elem.get_name().as_ref() == Some(&self.name)
                     },
                     HTMLElementTypeId::HTMLImageElement => elem.get_name().is_some_and(|name| {
-                        name == *self.name ||
-                            !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
+                        name == *self.name
+                            || !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
                     }),
                     // TODO handle <embed> and <object>; these depend on whether the element is
                     // “exposed”, a concept that doesn’t fully make sense until embed/object
@@ -5481,8 +5486,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                 // Either there is no parser, which means the parsing ended;
                 // or script nesting level is 0, which means the method was
                 // called from outside a parser-executed script.
-                if self.is_prompting_or_unloading() ||
-                    self.ignore_destructive_writes_counter.get() > 0
+                if self.is_prompting_or_unloading()
+                    || self.ignore_destructive_writes_counter.get() > 0
                 {
                     // Step 4.
                     return Ok(());
@@ -5602,6 +5607,53 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     /// <https://html.spec.whatwg.org/multipage/#dom-document-visibilitystate>
     fn VisibilityState(&self) -> DocumentVisibilityState {
         self.visibility_state.get()
+    }
+
+    fn CreateExpression(
+        &self,
+        expression: DOMString,
+        resolver: Option<
+            Rc<crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver>,
+        >,
+    ) -> DomRoot<super::types::XPathExpression> {
+        let global = self.global();
+        let window = global.as_window();
+        let evaluator = XPathEvaluator::new(window, None, CanGc::note());
+        XPathEvaluatorMethods::<crate::DomTypeHolder>::CreateExpression(
+            &*evaluator,
+            expression,
+            resolver,
+        )
+    }
+
+    fn CreateNSResolver(&self, node_resolver: &Node) -> DomRoot<Node> {
+        let global = self.global();
+        let window = global.as_window();
+        let evaluator = XPathEvaluator::new(window, None, CanGc::note());
+        XPathEvaluatorMethods::<crate::DomTypeHolder>::CreateNSResolver(&*evaluator, node_resolver)
+    }
+
+    fn Evaluate(
+        &self,
+        expression: DOMString,
+        context_node: &Node,
+        resolver: Option<
+            Rc<crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver>,
+        >,
+        type_: u16,
+        result: Option<&super::types::XPathResult>,
+    ) -> Fallible<DomRoot<super::types::XPathResult>> {
+        let global = self.global();
+        let window = global.as_window();
+        let evaluator = XPathEvaluator::new(window, None, CanGc::note());
+        XPathEvaluatorMethods::<crate::DomTypeHolder>::Evaluate(
+            &*evaluator,
+            expression,
+            context_node,
+            resolver,
+            type_,
+            result,
+        )
     }
 }
 
@@ -5778,9 +5830,9 @@ fn is_named_element_with_name_attribute(elem: &Element) -> bool {
         _ => return false,
     };
     match type_ {
-        HTMLElementTypeId::HTMLFormElement |
-        HTMLElementTypeId::HTMLIFrameElement |
-        HTMLElementTypeId::HTMLImageElement => true,
+        HTMLElementTypeId::HTMLFormElement
+        | HTMLElementTypeId::HTMLIFrameElement
+        | HTMLElementTypeId::HTMLImageElement => true,
         // TODO handle <embed> and <object>; these depend on whether the element is
         // “exposed”, a concept that doesn’t fully make sense until embed/object
         // behaviour is actually implemented
