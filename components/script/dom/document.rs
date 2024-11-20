@@ -94,7 +94,6 @@ use crate::dom::bindings::codegen::Bindings::TouchBinding::TouchMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
     FrameRequestCallback, ScrollBehavior, WindowMethods,
 };
-use crate::dom::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
 use crate::dom::bindings::codegen::UnionTypes::{NodeOrString, StringOrElementCreationOptions};
 use crate::dom::bindings::error::{Error, ErrorInfo, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
@@ -189,6 +188,8 @@ use crate::stylesheet_set::StylesheetSetRef;
 use crate::task::TaskBox;
 use crate::task_source::{TaskSource, TaskSourceName};
 use crate::timers::OneshotTimerCallback;
+
+use super::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
 
 /// The number of times we are allowed to see spurious `requestAnimationFrame()` calls before
 /// falling back to fake ones.
@@ -679,6 +680,12 @@ impl Document {
     #[inline]
     pub fn is_html_document(&self) -> bool {
         self.is_html_document
+    }
+
+    pub fn is_xhtml_document(&self) -> bool {
+        self.content_type.type_() == mime::APPLICATION
+            && self.content_type.subtype().as_str() == "xhtml"
+            && self.content_type.suffix() == Some(mime::XML)
     }
 
     pub fn set_https_state(&self, https_state: HttpsState) {
@@ -4511,11 +4518,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             local_name.make_ascii_lowercase();
         }
 
-        let is_xhtml = self.content_type.type_() == mime::APPLICATION
-            && self.content_type.subtype().as_str() == "xhtml"
-            && self.content_type.suffix() == Some(mime::XML);
-
-        let ns = if self.is_html_document || is_xhtml {
+        let ns = if self.is_html_document || self.is_xhtml_document() {
             ns!(html)
         } else {
             ns!()
@@ -5616,14 +5619,18 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         let global = self.global();
         let window = global.as_window();
         let evaluator = XPathEvaluator::new(window, None, CanGc::note());
-        evaluator.CreateExpression(expression, resolver)
+        XPathEvaluatorMethods::<crate::DomTypeHolder>::CreateExpression(
+            &*evaluator,
+            expression,
+            resolver,
+        )
     }
 
     fn CreateNSResolver(&self, node_resolver: &Node) -> DomRoot<Node> {
         let global = self.global();
         let window = global.as_window();
         let evaluator = XPathEvaluator::new(window, None, CanGc::note());
-        evaluator.CreateNSResolver(node_resolver)
+        XPathEvaluatorMethods::<crate::DomTypeHolder>::CreateNSResolver(&*evaluator, node_resolver)
     }
 
     fn Evaluate(
@@ -5639,7 +5646,14 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         let global = self.global();
         let window = global.as_window();
         let evaluator = XPathEvaluator::new(window, None, CanGc::note());
-        evaluator.Evaluate(expression, context_node, resolver, type_, result)
+        XPathEvaluatorMethods::<crate::DomTypeHolder>::Evaluate(
+            &*evaluator,
+            expression,
+            context_node,
+            resolver,
+            type_,
+            result,
+        )
     }
 }
 

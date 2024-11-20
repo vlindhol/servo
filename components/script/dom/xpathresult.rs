@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
 
@@ -15,6 +17,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
+use crate::xpath::{NodesetHelpers, Value};
 
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
@@ -51,35 +54,83 @@ impl TryFrom<u16> for XPathResultType {
     }
 }
 
+#[derive(JSTraceable, MallocSizeOf)]
+pub enum XPathResultValue {
+    Boolean(bool),
+    /// A IEEE-754 double-precision floating point number
+    Number(f64),
+    String(DOMString),
+    /// A collection of unique nodes
+    Nodeset(Vec<DomRoot<Node>>),
+}
+
+impl<'n> From<Value> for XPathResultValue {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Boolean(b) => XPathResultValue::Boolean(b),
+            Value::Number(n) => XPathResultValue::Number(n),
+            Value::String(s) => XPathResultValue::String(s.into()),
+            Value::Nodeset(nodes) => {
+                // Put the evaluation result into (unique) document order. This also re-roots them
+                // so that we are sure we can hold them for the lifetime of this XPathResult.
+                let rooted_nodes = nodes.document_order_unique();
+                XPathResultValue::Nodeset(rooted_nodes)
+            },
+        }
+    }
+}
+
 #[dom_struct]
 pub struct XPathResult {
     reflector_: Reflector,
     window: Dom<Window>,
     result_type: XPathResultType,
-    invalid_iterator: bool,
+    value: XPathResultValue,
+    iterator_invalid: Cell<bool>,
+    iterator_pos: Cell<usize>,
 }
 
 impl XPathResult {
-    fn new_inherited(window: &Window, result_type: XPathResultType) -> XPathResult {
+    fn new_inherited(
+        window: &Window,
+        result_type: XPathResultType,
+        value: XPathResultValue,
+    ) -> XPathResult {
+        // TODO(vlindhol): if the wanted result type is AnyUnorderedNode | FirstOrderedNode,
+        // we could drop all nodes except one to save memory.
+        let inferred_result_type = if result_type == XPathResultType::Any {
+            match value {
+                XPathResultValue::Boolean(_) => XPathResultType::Boolean,
+                XPathResultValue::Number(_) => XPathResultType::Number,
+                XPathResultValue::String(_) => XPathResultType::String,
+                XPathResultValue::Nodeset(_) => XPathResultType::UnorderedNodeIterator,
+            }
+        } else {
+            result_type
+        };
+
         XPathResult {
             reflector_: Reflector::new(),
             window: Dom::from_ref(window),
-            result_type,
-            invalid_iterator: false,
+            result_type: inferred_result_type,
+            iterator_invalid: Cell::new(false),
+            iterator_pos: Cell::new(0),
+            value,
         }
     }
 
-    /// `result_type` should be anything but `XPathResultType::Any`. That value is only
-    /// used when evaluating an XPath expression and the caller says "you decide which
-    /// type this result will have".
+    /// NB: Blindly trusts `result_type` and constructs an object regardless of the contents
+    /// of `value`. The exception is `XPathResultType::Any`, for which we look at the value
+    /// to determine the type.
     pub fn new(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
         result_type: XPathResultType,
+        value: XPathResultValue,
     ) -> DomRoot<XPathResult> {
         reflect_dom_object_with_proto(
-            Box::new(XPathResult::new_inherited(window, result_type)),
+            Box::new(XPathResult::new_inherited(window, result_type, value)),
             window,
             proto,
             can_gc,
@@ -87,60 +138,77 @@ impl XPathResult {
     }
 }
 
-impl XPathResultMethods for XPathResult {
+impl XPathResultMethods<crate::DomTypeHolder> for XPathResult {
     fn ResultType(&self) -> u16 {
         self.result_type as u16
     }
 
     fn GetNumberValue(&self) -> Fallible<f64> {
-        if !matches!(self.result_type, XPathResultType::Number) {
-            return Err(Error::Type(
+        match (&self.value, self.result_type) {
+            (XPathResultValue::Number(n), XPathResultType::Number) => Ok(*n),
+            _ => Err(Error::Type(
                 "Can't get number value for non-number XPathResult".to_string(),
-            ));
+            )),
         }
-        todo!()
     }
 
     fn GetStringValue(&self) -> Fallible<DOMString> {
-        if !matches!(self.result_type, XPathResultType::String) {
-            return Err(Error::Type(
+        match (&self.value, self.result_type) {
+            (XPathResultValue::String(s), XPathResultType::String) => Ok(s.clone()),
+            _ => Err(Error::Type(
                 "Can't get string value for non-string XPathResult".to_string(),
-            ));
+            )),
         }
-        todo!()
     }
 
     fn GetBooleanValue(&self) -> Fallible<bool> {
-        if !matches!(self.result_type, XPathResultType::Boolean) {
-            return Err(Error::Type(
+        match (&self.value, self.result_type) {
+            (XPathResultValue::Boolean(b), XPathResultType::Boolean) => Ok(*b),
+            _ => Err(Error::Type(
                 "Can't get boolean value for non-boolean XPathResult".to_string(),
-            ));
+            )),
         }
-        todo!()
     }
 
     /// Should error out if `result_type` isn't node-set compatible or if the DOM
     /// has been mutated since evaluating the XPath expression.
     fn IterateNext(&self) -> Fallible<Option<DomRoot<Node>>> {
-        if !matches!(
-            self.result_type,
-            XPathResultType::OrderedNodeIterator | XPathResultType::UnorderedNodeIterator
-        ) {
-            return Err(Error::Type(
-                "Can't iterate on XPathResult that is not a node-set".to_string(),
+        // TODO(vlindhol): observe if DOM has mutated => invalidate iterator and drop references
+        if self.iterator_invalid.get() {
+            return Err(Error::Range(
+                "Invalidated iterator for XPathResult, the DOM has mutated.".to_string(),
             ));
         }
-        todo!()
+
+        match (&self.value, self.result_type) {
+            (
+                XPathResultValue::Nodeset(nodes),
+                XPathResultType::OrderedNodeIterator | XPathResultType::UnorderedNodeIterator,
+            ) => {
+                let pos = self.iterator_pos.get();
+                if pos >= nodes.len() {
+                    Ok(None)
+                } else {
+                    let node = nodes[pos].clone();
+                    self.iterator_pos.set(pos + 1);
+                    Ok(Some(node))
+                }
+            },
+            _ => Err(Error::Type(
+                "Can't iterate on XPathResult that is not a node-set".to_string(),
+            )),
+        }
     }
 
     fn GetInvalidIteratorState(&self) -> Fallible<bool> {
-        if self.invalid_iterator
+        let is_iterator_invalid = self.iterator_invalid.get();
+        if is_iterator_invalid
             || matches!(
                 self.result_type,
                 XPathResultType::OrderedNodeIterator | XPathResultType::UnorderedNodeIterator
             )
         {
-            Ok(self.invalid_iterator)
+            Ok(is_iterator_invalid)
         } else {
             Err(Error::Type(
                 "Can't iterate on XPathResult that is not a node-set".to_string(),
@@ -149,41 +217,38 @@ impl XPathResultMethods for XPathResult {
     }
 
     fn GetSnapshotLength(&self) -> Fallible<u32> {
-        if !matches!(
-            self.result_type,
-            XPathResultType::OrderedNodeSnapshot | XPathResultType::UnorderedNodeSnapshot
-        ) {
-            return Err(Error::Type(
+        match (&self.value, self.result_type) {
+            (
+                XPathResultValue::Nodeset(nodes),
+                XPathResultType::OrderedNodeSnapshot | XPathResultType::UnorderedNodeSnapshot,
+            ) => Ok(nodes.len() as u32),
+            _ => Err(Error::Type(
                 "Can't get snapshot length of XPathResult that is not a snapshot".to_string(),
-            ));
+            )),
         }
-
-        todo!()
     }
 
-    fn SnapshotItem(&self, _index: u32) -> Fallible<Option<DomRoot<Node>>> {
-        if !matches!(
-            self.result_type,
-            XPathResultType::OrderedNodeSnapshot | XPathResultType::UnorderedNodeSnapshot
-        ) {
-            return Err(Error::Type(
+    fn SnapshotItem(&self, index: u32) -> Fallible<Option<DomRoot<Node>>> {
+        match (&self.value, self.result_type) {
+            (
+                XPathResultValue::Nodeset(nodes),
+                XPathResultType::OrderedNodeSnapshot | XPathResultType::UnorderedNodeSnapshot,
+            ) => Ok(nodes.get(index as usize).cloned()),
+            _ => Err(Error::Type(
                 "Can't get snapshot item of XPathResult that is not a snapshot".to_string(),
-            ));
+            )),
         }
-
-        todo!()
     }
 
     fn GetSingleNodeValue(&self) -> Fallible<Option<DomRoot<Node>>> {
-        if !matches!(
-            self.result_type,
-            XPathResultType::AnyUnorderedNode | XPathResultType::FirstOrderedNode
-        ) {
-            return Err(Error::Type(
+        match (&self.value, self.result_type) {
+            (
+                XPathResultValue::Nodeset(nodes),
+                XPathResultType::AnyUnorderedNode | XPathResultType::FirstOrderedNode,
+            ) => Ok(nodes.get(0).cloned()),
+            _ => Err(Error::Type(
                 "Can't get first node on XPathResult that is not of type 'any unordered node' or 'first ordered node'".to_string(),
-            ));
+            )),
         }
-
-        todo!()
     }
 }

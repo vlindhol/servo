@@ -20,6 +20,8 @@ use crate::dom::xpathexpression::XPathExpression;
 use crate::dom::xpathresult::XPathResult;
 use crate::script_runtime::CanGc;
 
+use super::bindings::error::Error;
+
 #[dom_struct]
 pub struct XPathEvaluator {
     reflector_: Reflector,
@@ -48,7 +50,7 @@ impl XPathEvaluator {
     }
 }
 
-impl XPathEvaluatorMethods for XPathEvaluator {
+impl XPathEvaluatorMethods<crate::DomTypeHolder> for XPathEvaluator {
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -66,7 +68,10 @@ impl XPathEvaluatorMethods for XPathEvaluator {
     ) -> DomRoot<XPathExpression> {
         let global = self.global();
         let window = global.as_window();
-        XPathExpression::new(&window, None, CanGc::note(), expression)
+        // NB: this function is *not* Fallible according to the spec, so we swallow any parsing errors and
+        // just pass a None as the expression... it's not great.
+        let parsed_expression = crate::xpath::parse(&expression);
+        XPathExpression::new(window, None, CanGc::note(), parsed_expression.ok())
     }
 
     // Legacy: the spec tells us to just return `node_resolver` as-is
@@ -86,7 +91,13 @@ impl XPathEvaluatorMethods for XPathEvaluator {
     ) -> Fallible<DomRoot<XPathResult>> {
         let global = self.global();
         let window = global.as_window();
-        let expression = XPathExpression::new(window, None, CanGc::note(), expression_str);
-        expression.Evaluate(context_node, result_type, result)
+        let parsed_expression = crate::xpath::parse(&expression_str).map_err(|_| Error::Syntax)?;
+        let expression = XPathExpression::new(window, None, CanGc::note(), Some(parsed_expression));
+        XPathExpressionMethods::<crate::DomTypeHolder>::Evaluate(
+            &*expression,
+            context_node,
+            result_type,
+            result,
+        )
     }
 }
