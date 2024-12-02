@@ -47,14 +47,16 @@ use nom::{
     bytes::complete::{tag, take_while1},
     character::complete::{alpha1, alphanumeric1, char, digit1, multispace0},
     combinator::{map, opt, recognize},
-    error::{Error as NomError, ErrorKind as NomErrorKind},
+    error::{convert_error, ErrorKind as NomErrorKind, ParseError, VerboseError},
     multi::{many0, separated_list0},
     sequence::{delimited, pair, preceded, tuple},
     Finish, IResult,
 };
 
 pub fn parse(input: &str) -> Result<Expr, OwnedParserError> {
-    let (_, ast) = expr(input).finish().map_err(OwnedParserError::from)?;
+    let (_, ast) = expr(input)
+        .finish()
+        .map_err(|e| OwnedParserError::new(input, e))?;
     Ok(ast)
 }
 
@@ -374,40 +376,48 @@ impl CoreFunction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnedParserError {
     input: String,
-    kind: NomErrorKind,
+    errors: Vec<(String, nom::error::VerboseErrorKind)>,
+    display: String,
 }
 
-impl<'a> From<NomError<&'a str>> for OwnedParserError {
-    fn from(err: NomError<&'a str>) -> Self {
+impl OwnedParserError {
+    pub fn new(input: &str, error: VerboseError<&str>) -> Self {
         OwnedParserError {
-            input: err.input.to_string(),
-            kind: err.code,
+            input: input.to_string(),
+            errors: error
+                .errors
+                .into_iter()
+                .map(|(s, k)| (s.to_string(), k))
+                .collect(),
+            display: convert_error(input, error),
         }
     }
 }
 
 impl std::fmt::Display for OwnedParserError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "error {:?} at: {}", self.kind, self.input)
+        write!(f, "{}", self.display)
     }
 }
 
 impl std::error::Error for OwnedParserError {}
 
+type XPathParserResult<'a, O> = IResult<&'a str, O, VerboseError<&'a str>>;
+
 // [1] XPath and
 // [2] Expr combined.
 /// Top-level parser
-fn expr(input: &str) -> IResult<&str, Expr> {
+fn expr(input: &str) -> XPathParserResult<Expr> {
     expr_single(input)
 }
 
 // [3] ExprSingle
-fn expr_single(input: &str) -> IResult<&str, Expr> {
+fn expr_single(input: &str) -> XPathParserResult<Expr> {
     or_expr(input)
 }
 
 // [4] OrExpr
-fn or_expr(input: &str) -> IResult<&str, Expr> {
+fn or_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = and_expr(input)?;
     let (input, rest) = many0(preceded(ws(tag("or")), and_expr))(input)?;
 
@@ -419,7 +429,7 @@ fn or_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [5] AndExpr
-fn and_expr(input: &str) -> IResult<&str, Expr> {
+fn and_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = equality_expr(input)?;
     let (input, rest) = many0(preceded(ws(tag("and")), equality_expr))(input)?;
 
@@ -431,7 +441,7 @@ fn and_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [6] EqualityExpr
-fn equality_expr(input: &str) -> IResult<&str, Expr> {
+fn equality_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = relational_expr(input)?;
     let (input, rest) = many0(tuple((
         ws(alt((
@@ -450,7 +460,7 @@ fn equality_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [7] RelationalExpr
-fn relational_expr(input: &str) -> IResult<&str, Expr> {
+fn relational_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = additive_expr(input)?;
     let (input, rest) = many0(tuple((
         ws(alt((
@@ -471,7 +481,7 @@ fn relational_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [8] AdditiveExpr
-fn additive_expr(input: &str) -> IResult<&str, Expr> {
+fn additive_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = multiplicative_expr(input)?;
     let (input, rest) = many0(tuple((
         ws(alt((
@@ -490,7 +500,7 @@ fn additive_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [9] MultiplicativeExpr
-fn multiplicative_expr(input: &str) -> IResult<&str, Expr> {
+fn multiplicative_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = unary_expr(input)?;
     let (input, rest) = many0(tuple((
         ws(alt((
@@ -510,7 +520,7 @@ fn multiplicative_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [10] UnaryExpr
-fn unary_expr(input: &str) -> IResult<&str, Expr> {
+fn unary_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, minus_count) = many0(ws(char('-')))(input)?;
     let (input, expr) = union_expr(input)?;
 
@@ -521,7 +531,7 @@ fn unary_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [11] UnionExpr
-fn union_expr(input: &str) -> IResult<&str, Expr> {
+fn union_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = path_expr(input)?;
     let (input, rest) = many0(preceded(ws(char('|')), path_expr))(input)?;
 
@@ -534,7 +544,7 @@ fn union_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [12] PathExpr
-fn path_expr(input: &str) -> IResult<&str, Expr> {
+fn path_expr(input: &str) -> XPathParserResult<Expr> {
     alt((
         // "//" RelativePathExpr
         map(pair(tag("//"), relative_path_expr), |(_, rel_path)| {
@@ -566,7 +576,7 @@ fn path_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [13] RelativePathExpr
-fn relative_path_expr(input: &str) -> IResult<&str, Expr> {
+fn relative_path_expr(input: &str) -> XPathParserResult<Expr> {
     let (input, first) = step_expr(input)?;
     let (input, steps) = many0(pair(
         // ("/" | "//")
@@ -598,7 +608,7 @@ fn relative_path_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 // [14] StepExpr
-fn step_expr(input: &str) -> IResult<&str, StepExpr> {
+fn step_expr(input: &str) -> XPathParserResult<StepExpr> {
     alt((
         map(filter_expr, StepExpr::Filter),
         map(axis_step, StepExpr::Axis),
@@ -606,7 +616,7 @@ fn step_expr(input: &str) -> IResult<&str, StepExpr> {
 }
 
 // [15] AxisStep
-fn axis_step(input: &str) -> IResult<&str, AxisStep> {
+fn axis_step(input: &str) -> XPathParserResult<AxisStep> {
     let (input, (step, predicates)) =
         pair(alt((forward_step, reverse_step)), predicate_list)(input)?;
 
@@ -622,7 +632,7 @@ fn axis_step(input: &str) -> IResult<&str, AxisStep> {
 }
 
 // [16] ForwardStep
-fn forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
+fn forward_step(input: &str) -> XPathParserResult<(Axis, NodeTest)> {
     alt((
         // ForwardAxis NodeTest
         pair(forward_axis, node_test),
@@ -632,7 +642,7 @@ fn forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
 }
 
 // [17] ForwardAxis
-fn forward_axis(input: &str) -> IResult<&str, Axis> {
+fn forward_axis(input: &str) -> XPathParserResult<Axis> {
     let (input, axis) = alt((
         value(Axis::Child, tag("child::")),
         value(Axis::Descendant, tag("descendant::")),
@@ -648,7 +658,7 @@ fn forward_axis(input: &str) -> IResult<&str, Axis> {
 }
 
 // [18] AbbrevForwardStep
-fn abbrev_forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
+fn abbrev_forward_step(input: &str) -> XPathParserResult<(Axis, NodeTest)> {
     let (input, attr) = opt(char('@'))(input)?;
     let (input, test) = node_test(input)?;
 
@@ -666,7 +676,7 @@ fn abbrev_forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
 }
 
 // [19] ReverseStep
-fn reverse_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
+fn reverse_step(input: &str) -> XPathParserResult<(Axis, NodeTest)> {
     alt((
         // ReverseAxis NodeTest
         pair(reverse_axis, node_test),
@@ -676,7 +686,7 @@ fn reverse_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
 }
 
 // [20] ReverseAxis
-fn reverse_axis(input: &str) -> IResult<&str, Axis> {
+fn reverse_axis(input: &str) -> XPathParserResult<Axis> {
     alt((
         value(Axis::Parent, tag("parent::")),
         value(Axis::Ancestor, tag("ancestor::")),
@@ -687,14 +697,14 @@ fn reverse_axis(input: &str) -> IResult<&str, Axis> {
 }
 
 // [21] AbbrevReverseStep
-fn abbrev_reverse_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
+fn abbrev_reverse_step(input: &str) -> XPathParserResult<(Axis, NodeTest)> {
     map(tag(".."), |_| {
         (Axis::Parent, NodeTest::Kind(KindTest::Node))
     })(input)
 }
 
 // [22] NodeTest
-fn node_test(input: &str) -> IResult<&str, NodeTest> {
+fn node_test(input: &str) -> XPathParserResult<NodeTest> {
     alt((
         map(kind_test, NodeTest::Kind),
         map(name_test, |name| match name {
@@ -712,7 +722,7 @@ enum NameTest {
     Wildcard,
 }
 
-fn name_test(input: &str) -> IResult<&str, NameTest> {
+fn name_test(input: &str) -> XPathParserResult<NameTest> {
     alt((
         // NCName ":" "*"
         map(tuple((ncname, char(':'), char('*'))), |(prefix, _, _)| {
@@ -729,7 +739,7 @@ fn name_test(input: &str) -> IResult<&str, NameTest> {
 }
 
 // [25] FilterExpr
-fn filter_expr(input: &str) -> IResult<&str, FilterExpr> {
+fn filter_expr(input: &str) -> XPathParserResult<FilterExpr> {
     let (input, primary) = primary_expr(input)?;
     let (input, predicates) = predicate_list(input)?;
 
@@ -743,19 +753,19 @@ fn filter_expr(input: &str) -> IResult<&str, FilterExpr> {
 }
 
 // [26] PredicateList
-fn predicate_list(input: &str) -> IResult<&str, PredicateListExpr> {
+fn predicate_list(input: &str) -> XPathParserResult<PredicateListExpr> {
     let (input, predicates) = many0(predicate)(input)?;
     Ok((input, PredicateListExpr { predicates }))
 }
 
 // [27] Predicate
-fn predicate(input: &str) -> IResult<&str, PredicateExpr> {
+fn predicate(input: &str) -> XPathParserResult<PredicateExpr> {
     let (input, expr) = delimited(ws(char('[')), expr, ws(char(']')))(input)?;
     Ok((input, PredicateExpr { expr }))
 }
 
 // [28] PrimaryExpr
-fn primary_expr(input: &str) -> IResult<&str, PrimaryExpr> {
+fn primary_expr(input: &str) -> XPathParserResult<PrimaryExpr> {
     alt((
         literal,
         var_ref,
@@ -768,37 +778,37 @@ fn primary_expr(input: &str) -> IResult<&str, PrimaryExpr> {
 }
 
 // [29] Literal
-fn literal(input: &str) -> IResult<&str, PrimaryExpr> {
+fn literal(input: &str) -> XPathParserResult<PrimaryExpr> {
     map(alt((numeric_literal, string_literal)), |lit| {
         PrimaryExpr::Literal(lit)
     })(input)
 }
 
 // [30] NumericLiteral
-fn numeric_literal(input: &str) -> IResult<&str, Literal> {
+fn numeric_literal(input: &str) -> XPathParserResult<Literal> {
     alt((decimal_literal, integer_literal))(input)
 }
 
 // [31] VarRef and
 // [32] VarName
-fn var_ref(input: &str) -> IResult<&str, PrimaryExpr> {
+fn var_ref(input: &str) -> XPathParserResult<PrimaryExpr> {
     let (input, _) = char('$')(input)?;
     let (input, name) = qname(input)?;
     Ok((input, PrimaryExpr::Variable(name)))
 }
 
 // [33] ParenthesizedExpr
-fn parenthesized_expr(input: &str) -> IResult<&str, Expr> {
+fn parenthesized_expr(input: &str) -> XPathParserResult<Expr> {
     delimited(ws(char('(')), expr, ws(char(')')))(input)
 }
 
 // [34] ContextItemExpr
-fn context_item_expr(input: &str) -> IResult<&str, PrimaryExpr> {
+fn context_item_expr(input: &str) -> XPathParserResult<PrimaryExpr> {
     map(char('.'), |_| PrimaryExpr::ContextItem)(input)
 }
 
 // [35] FunctionCall
-fn function_call(input: &str) -> IResult<&str, PrimaryExpr> {
+fn function_call(input: &str) -> XPathParserResult<PrimaryExpr> {
     let (input, name) = qname(input)?;
     let (input, args) = delimited(
         ws(char('(')),
@@ -807,7 +817,8 @@ fn function_call(input: &str) -> IResult<&str, PrimaryExpr> {
     )(input)?;
 
     // Helper to create error
-    let arity_error = || nom::Err::Error(NomError::new(input, NomErrorKind::Verify));
+    let arity_error =
+        || nom::Err::Error(VerboseError::from_error_kind(input, NomErrorKind::Verify));
 
     let core_fn = match name.local_part.as_str() {
         // Node Set Functions
@@ -888,33 +899,38 @@ fn function_call(input: &str) -> IResult<&str, PrimaryExpr> {
         "lang" => CoreFunction::Lang(Box::new(args.into_iter().next().ok_or_else(arity_error)?)),
 
         // Unknown function
-        _ => return Err(nom::Err::Error(NomError::new(input, NomErrorKind::Verify))),
+        _ => {
+            return Err(nom::Err::Error(VerboseError::from_error_kind(
+                input,
+                NomErrorKind::Verify,
+            )))
+        },
     };
 
     Ok((input, PrimaryExpr::Function(core_fn)))
 }
 
 // [36] KindTest
-fn kind_test(input: &str) -> IResult<&str, KindTest> {
+fn kind_test(input: &str) -> XPathParserResult<KindTest> {
     alt((pi_test, comment_test, text_test, any_kind_test))(input)
 }
 
 // [37] AnyKindTest
-fn any_kind_test(input: &str) -> IResult<&str, KindTest> {
+fn any_kind_test(input: &str) -> XPathParserResult<KindTest> {
     map(tuple((tag("node"), ws(char('(')), ws(char(')')))), |_| {
         KindTest::Node
     })(input)
 }
 
 // [38] TextTest
-fn text_test(input: &str) -> IResult<&str, KindTest> {
+fn text_test(input: &str) -> XPathParserResult<KindTest> {
     map(tuple((tag("text"), ws(char('(')), ws(char(')')))), |_| {
         KindTest::Text
     })(input)
 }
 
 // [39] CommentTest
-fn comment_test(input: &str) -> IResult<&str, KindTest> {
+fn comment_test(input: &str) -> XPathParserResult<KindTest> {
     map(
         tuple((tag("comment"), ws(char('(')), ws(char(')')))),
         |_| KindTest::Comment,
@@ -922,7 +938,7 @@ fn comment_test(input: &str) -> IResult<&str, KindTest> {
 }
 
 // [40] PITest
-fn pi_test(input: &str) -> IResult<&str, KindTest> {
+fn pi_test(input: &str) -> XPathParserResult<KindTest> {
     map(
         tuple((
             tag("processing-instruction"),
@@ -946,13 +962,13 @@ where
     delimited(multispace0, inner, multispace0)
 }
 
-fn integer_literal(input: &str) -> IResult<&str, Literal> {
+fn integer_literal(input: &str) -> XPathParserResult<Literal> {
     map(recognize(tuple((opt(char('-')), digit1))), |s: &str| {
         Literal::Numeric(NumericLiteral::Integer(s.parse().unwrap()))
     })(input)
 }
 
-fn decimal_literal(input: &str) -> IResult<&str, Literal> {
+fn decimal_literal(input: &str) -> XPathParserResult<Literal> {
     map(
         recognize(tuple((opt(char('-')), opt(digit1), char('.'), digit1))),
         |s: &str| Literal::Numeric(NumericLiteral::Decimal(s.parse().unwrap())),
@@ -960,7 +976,7 @@ fn decimal_literal(input: &str) -> IResult<&str, Literal> {
 }
 
 // [41] StringLiteral
-fn string_literal(input: &str) -> IResult<&str, Literal> {
+fn string_literal(input: &str) -> XPathParserResult<Literal> {
     alt((
         delimited(
             char('"'),
@@ -980,7 +996,7 @@ fn string_literal(input: &str) -> IResult<&str, Literal> {
 }
 
 // QName parser
-fn qname(input: &str) -> IResult<&str, QName> {
+fn qname(input: &str) -> XPathParserResult<QName> {
     let (input, prefix) = opt(tuple((ncname, char(':'))))(input)?;
     let (input, local) = ncname(input)?;
 
@@ -994,7 +1010,7 @@ fn qname(input: &str) -> IResult<&str, QName> {
 }
 
 // NCName parser
-fn ncname(input: &str) -> IResult<&str, &str> {
+fn ncname(input: &str) -> XPathParserResult<&str> {
     recognize(pair(
         alpha1,
         many0(alt((alphanumeric1, tag("-"), tag("_")))),
@@ -1062,6 +1078,21 @@ mod tests {
                 },
                 Err(e) => panic!("Failed to parse '{}': {:?}", input, e),
             }
+        }
+    }
+
+    #[rstest]
+    #[case("double_quote_in_singles", " 'a\"bc' ")]
+    #[case("single_quote_in_doubles", " \"a'bc\" ")]
+    fn test_tricky_input(#[case] name: &str, #[case] input: &str) {
+        set_snapshot_suffix!("{}", name);
+
+        if let Ok((_, output)) = expr(input) {
+            with_settings!({ description => input }, {
+                assert_debug_snapshot!(output);
+            });
+        } else {
+            panic!("Failed to parse '{}'", input);
         }
     }
 
